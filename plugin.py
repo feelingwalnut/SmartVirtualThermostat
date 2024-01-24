@@ -24,7 +24,7 @@ Version: 0.4.14 (November 13, 2023) - see history.txt for versions history
         <param field="Password" label="Password" width="200px" required="false" default=""/>
         <param field="Mode1" label="Inside Temperature Sensors (csv list of idx)" width="100px" required="true" default="0"/>
         <param field="Mode2" label="Outside Temperature Sensors (csv list of idx)" width="100px" required="false" default=""/>
-        <param field="Mode3" label="Heating Switches (csv list of idx)" width="100px" required="true" default="0"/>
+        <param field="Mode3" label="Heating Switches by idx (pri,mary-secon.dary 1,2-3.4)" width="100px" required="true" default="0"/>
         <param field="Mode4" label="Apply minimum heating per cycle" width="200px">
             <options>
         <option label="only when heating required" value="Normal"  default="true" />
@@ -109,6 +109,7 @@ class BasePlugin:
         self.loglevel = None
         self.intemperror = False
         self.versionsupported = False
+        self.SecondaryHeater = None  # Secondary heater idx
         return
 
     @staticmethod
@@ -193,9 +194,34 @@ class BasePlugin:
         self.WriteLog("Inside Temperature sensors = {}".format(self.InTempSensors), "Verbose")
         self.OutTempSensors = parseCSV(Parameters["Mode2"])
         self.WriteLog("Outside Temperature sensors = {}".format(self.OutTempSensors), "Verbose")
-        self.Heaters = parseCSV(Parameters["Mode3"])
-        self.WriteLog("Heaters = {}".format(self.Heaters), "Verbose")
+        # Parse heater indexes and look for secondary heaters specified with a dash '-'
+        heater_indexes = Parameters["Mode3"].split(',')
+        self.Heaters = []  # Initialize an empty list for primary heaters
+        self.SecondaryHeaters = []  # Initialize an empty list for secondary heaters
+        for idx in heater_indexes:
+            if '-' in idx:  # Check if this is the secondary heater(s)
+                primary_idx, secondary_heater_idxs = idx.split('-')
+                try:
+                    self.Heaters.append(int(primary_idx))  # Add primary heater index
+                    self.WriteLog("Primary Heater idx added: {}".format(primary_idx), "Verbose")
+                except ValueError:
+                    Domoticz.Error("Invalid Primary Heater idx specified: {}".format(primary_idx))
+                for secondary_idx in secondary_heater_idxs.split('.'):  # Secondary heaters are separated by period
+                    try:
+                        self.SecondaryHeaters.append(int(secondary_idx))
+                        self.WriteLog("Secondary Heater idx added: {}".format(secondary_idx), "Verbose")
+                    except ValueError:
+                        Domoticz.Error("Invalid Secondary Heater idx specified: {}".format(secondary_idx))
+            else:
+                try:
+                    self.Heaters.append(int(idx))
+                except ValueError:
+                    Domoticz.Error("Invalid Heater idx specified: {}".format(idx))
         
+        self.WriteLog("Primary Heaters = {}".format(self.Heaters), "Verbose")
+        self.WriteLog("Secondary Heaters = {}".format(self.SecondaryHeaters), "Verbose")
+        if not self.SecondaryHeaters:
+            self.WriteLog("No Secondary Heater idx specified. No secondary heaters will be used.", "Verbose")
         # build dict of status of all temp sensors to be used when handling timeouts
         for sensor in itertools.chain(self.InTempSensors, self.OutTempSensors):
             self.ActiveSensors[sensor] = True
@@ -280,8 +306,12 @@ class BasePlugin:
                     # System is set to Celsius, no conversion needed
                     sValue = str(Level)
 
-                # Update the system temperature unit to the current setting
-                self.systemTempUnit = currentSystemTempUnit
+        # Handle the secondary heater idx parameter
+        if Unit == 7:  # Secondary heater idx
+            self.SecondaryHeater = Level if Command == "On" else None
+
+            # Update the system temperature unit to the current setting
+            self.systemTempUnit = currentSystemTempUnit
 
         Devices[Unit].Update(nValue=nvalue, sValue=svalue)
 
@@ -415,11 +445,16 @@ class BasePlugin:
                 "Calculated power is {}, applying minimum power of {}".format(power, self.minheatpower), "Verbose")
             power = self.minheatpower
 
-        # apply full power if boostt mode and intemp is more than 1°C below setpoint
+        # apply full power if boost mode and intemp is more than 1°C below setpoint
         if self.boost and (self.setpoint - self.intemp) > self.boostgap:
             self.WriteLog(
                 "Applying boost mode since current temperature is more than {}°C lower than setpoint".format(self.boostgap), "Verbose")
             power = 100
+            # Trigger the secondary heater if it's defined
+            if self.SecondaryHeaters:  # Check if there are secondary heaters defined
+                for secondary_idx in self.SecondaryHeaters:
+                    DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=On".format(secondary_idx))
+                    self.WriteLog("Secondary heater {} triggered due to boost mode.".format(secondary_idx), "Verbose")
 
         heatduration = round(power * self.calculate_period / 100)
         self.WriteLog("Calculation: Power = {} -> heat duration = {} minutes".format(power, heatduration), "Verbose")
@@ -431,14 +466,14 @@ class BasePlugin:
             self.endheat = datetime.now() + timedelta(minutes=heatduration)
             Domoticz.Debug("End Heat time = " + str(self.endheat))
             self.switchHeat(True)
-            #if self.Internals["ALStatus"] < 2:
-            self.Internals['LastPwr'] = power
-            self.Internals['LastInT'] = self.intemp
-            self.Internals['LastOutT'] = self.outtemp
-            self.Internals['LastSetPoint'] = self.setpoint
-            if self.Internals["ALStatus"] != 2:
-                self.Internals['ALStatus'] = 1
-                self.saveUserVar()  # update user variables with latest learning
+            if self.Internals["ALStatus"] < 2:
+                self.Internals['LastPwr'] = power
+                self.Internals['LastInT'] = self.intemp
+                self.Internals['LastOutT'] = self.outtemp
+                self.Internals['LastSetPoint'] = self.setpoint
+                if self.Internals["ALStatus"] != 2:
+                    self.Internals['ALStatus'] = 1
+                    self.saveUserVar()  # update user variables with latest learning
 
         self.lastcalc = datetime.now()
 
@@ -503,7 +538,7 @@ class BasePlugin:
             Domoticz.Error("none of the devices in the 'heaters' parameter is a switch... no action !")
             return
 
-        # flip on / off as needed
+         # flip on / off as needed
         self.heat = switch
         command = "On" if switch else "Off"
         Domoticz.Debug("Heating '{}'".format(command))
@@ -513,6 +548,18 @@ class BasePlugin:
         if switch:
             Domoticz.Debug("End Heat time = " + str(self.endheat))
 
+        # Trigger the secondary heater if it's defined and we're switching on the main heaters
+        # and if the boost mode is active.
+        if switch and self.boost and self.SecondaryHeater:
+            # Trigger the secondary heater
+            result = DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=On".format(self.SecondaryHeater))
+            Domoticz.Debug("Secondary heater On result: {}".format(result))
+
+        # Handle the secondary heaters: turn them off when the primary heaters are turned off
+        if not switch and self.SecondaryHeaters:  # Check if there are secondary heaters defined and we're turning off
+            for secondary_idx in self.SecondaryHeaters:
+                result = DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Off".format(secondary_idx))
+                Domoticz.Debug("Secondary heater {} Off result: {}".format(secondary_idx, result))
 
     def readTemps(self):
 
