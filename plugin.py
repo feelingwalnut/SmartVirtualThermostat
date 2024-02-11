@@ -24,7 +24,7 @@ Version: 0.4.14 (November 13, 2023) - see history.txt for versions history
         <param field="Password" label="Password" width="200px" required="false" default=""/>
         <param field="Mode1" label="Inside Temperature Sensors (csv list of idx)" width="100px" required="true" default="0"/>
         <param field="Mode2" label="Outside Temperature Sensors (csv list of idx)" width="100px" required="false" default=""/>
-        <param field="Mode3" label="Heating Switches by idx (pri,mary-secon.dary 1,2-3.4)" width="100px" required="true" default="0"/>
+        <param field="Mode3" label="Heating Switches by idx (primary1,primary2-secondary1.secondary2)" width="100px" required="true" default="0"/>
         <param field="Mode4" label="Apply minimum heating per cycle" width="200px">
             <options>
         <option label="only when heating required" value="Normal"  default="true" />
@@ -96,7 +96,8 @@ class BasePlugin:
         self.pauserequestchangedtime = datetime.now()
         self.forced = False
         self.boost = True  # boost heating when boostgap is reached
-        self.boostgap = 0.5  # gap in °C between inside temp and setpoint above which turbo mode is active
+        self.boostgap = 1.0  # gap in ° between inside temp and setpoint above which turbo mode is active
+        self.boostConditionMetLastCycle = False
         self.intemp = 20.0
         self.outtemp = 20.0
         self.setpoint = 20.0
@@ -220,8 +221,14 @@ class BasePlugin:
         
         self.WriteLog("Primary Heaters = {}".format(self.Heaters), "Verbose")
         self.WriteLog("Secondary Heaters = {}".format(self.SecondaryHeaters), "Verbose")
-        if not self.SecondaryHeaters:
-            self.WriteLog("No Secondary Heater idx specified. No secondary heaters will be used.", "Verbose")
+         # After initializing primary and secondary heaters
+        if self.SecondaryHeaters:
+            self.boost = True  # Enable boost if there are secondary heaters
+            self.WriteLog("Boost mode enabled because secondary heaters are specified.", "Verbose")
+        else:
+            self.boost = False  # Disable boost if there are no secondary heaters
+            self.WriteLog("Boost mode disabled because no secondary heaters are specified.", "Verbose")
+
         # build dict of status of all temp sensors to be used when handling timeouts
         for sensor in itertools.chain(self.InTempSensors, self.OutTempSensors):
             self.ActiveSensors[sensor] = True
@@ -445,16 +452,22 @@ class BasePlugin:
                 "Calculated power is {}, applying minimum power of {}".format(power, self.minheatpower), "Verbose")
             power = self.minheatpower
 
-        # apply full power if boost mode and intemp is more than 1°C below setpoint
-        if self.boost and (self.setpoint - self.intemp) > self.boostgap:
-            self.WriteLog(
-                "Applying boost mode since current temperature is more than {}°C lower than setpoint".format(self.boostgap), "Verbose")
+        # Check for boost condition
+        boostNeeded = self.boost and (self.setpoint - self.intemp) > self.boostgap
+        # Apply boost only if the condition was met in the previous cycle and it's still needed
+        if boostNeeded and self.boostConditionMetLastCycle:    
+            self.WriteLog("Applying boost mode since current temperature is more than {}°C lower than setpoint".format(self.boostgap), "Verbose")
             power = 100
             # Trigger the secondary heater if it's defined
             if self.SecondaryHeaters:  # Check if there are secondary heaters defined
                 for secondary_idx in self.SecondaryHeaters:
                     DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=On".format(secondary_idx))
                     self.WriteLog("Secondary heater {} triggered due to boost mode.".format(secondary_idx), "Verbose")
+            elif boostNeeded:
+                self.WriteLog("Boost condition met, waiting for next cycle to apply boost.", "Verbose")
+
+        # Update the boostConditionMetLastCycle for the next cycle
+        self.boostConditionMetLastCycle = boostNeeded
 
         heatduration = round(power * self.calculate_period / 100)
         self.WriteLog("Calculation: Power = {} -> heat duration = {} minutes".format(power, heatduration), "Verbose")
